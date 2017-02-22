@@ -54,6 +54,8 @@ SLACK_API_TRANSLATOR = {
         "join": "channels.join",
         "leave": "groups.leave",
         "mark": "groups.mark",
+    },
+    "thread": {
     }
 
 }
@@ -447,6 +449,7 @@ class Channel(object):
         self.last_active_user = None
         self.muted = False
         self.got_history = False
+        self.threads = SearchList()
         #w.prnt("", "unread: {}".format(self.unread_count))
         if self.active:
             self.create_buffer()
@@ -473,6 +476,14 @@ class Channel(object):
         if self.channel_buffer is not None:
             aliases.append(self.channel_buffer)
         return aliases
+
+    def get_thread(self, thread_ts):
+        thread = self.threads.find('{}.{}'.format(self.identifier, thread_ts))
+        if not thread:
+            thread = ThreadChannel(self, thread_ts)
+            self.threads.append(thread)
+            channels.append(thread)
+        return thread
 
     def create_members_table(self):
         for user in self.members:
@@ -840,6 +851,45 @@ class Channel(object):
                 process_message(json.loads(message), True)
             async_slack_api_request(self.server.domain, self.server.token, SLACK_API_TRANSLATOR[self.type]["history"], {"channel": self.identifier, "count": BACKLOG_SIZE})
         self.got_history = True
+
+
+def gen_thread_name(thread_ts):
+    return sha.sha(str(thread_ts)).hexdigest()[:3]
+
+
+class ThreadChannel(Channel):
+
+    def __init__(self, parent, thread_ts):
+        self.thread_name = gen_thread_name(thread_ts)
+        self.thread_ts = thread_ts
+        self.parent = parent
+        self.type = 'thread'
+        kwargs = {
+            'name': '{}.{}'.format(parent.name, self.thread_name),
+            'id': '{}.{}'.format(parent.identifier, self.thread_ts),
+            'is_open': parent.active,
+            'members': parent.members
+        }
+        super(ThreadChannel, self).__init__(parent.server, **kwargs)
+
+    def create_buffer(self):
+        super(ThreadChannel, self).create_buffer()
+        w.buffer_merge(self.channel_buffer, self.parent.channel_buffer)
+
+    def send_message(self, message):
+        message = self.linkify_text(message)
+        dbg(message)
+        request = {"type": "message", "channel": self.parent.identifier, "thread_ts": self.thread_ts, "text": message, "_server": self.server.domain}
+        self.server.send_to_websocket(request)
+
+    def close(self, update_remote=True):
+        super(ThreadChannel, self).close(False)
+
+    def update_read_marker(self, time):
+        pass
+
+    def get_history(self):
+        pass
 
 
 class GroupChannel(Channel):
@@ -1574,10 +1624,16 @@ def process_reply(message_json):
     if "type" in item:
         if item["type"] == "message" and "channel" in item.keys():
             item["ts"] = message_json["ts"]
-            channels.find(item["channel"]).cache_message(item, from_me=True)
+
+            channel = channels.find(item["channel"])
+            if ("thread_ts" in item) and (item["thread_ts"] != item["ts"]):
+                channel = channel.get_thread(item["thread_ts"])
+
+            channel.cache_message(item, from_me=True)
+
             text = unfurl_refs(item["text"], ignore_alt_text=config.unfurl_ignore_alt_text)
 
-            channels.find(item["channel"]).buffer_prnt(item["user"], text, item["ts"])
+            channel.buffer_prnt(item["user"], text, item["ts"])
     dbg("REPLY {}".format(item))
 
 
@@ -1905,6 +1961,9 @@ def process_message(message_json, cache=True):
         else:
             server = servers.find(message_json["_server"])
             channel = channels.find(message_json["channel"])
+
+            if ("thread_ts" in message_json) and (message_json["thread_ts"] != message_json["ts"]):
+                channel = channel.get_thread(message_json["thread_ts"])
 
             # do not process messages in unexpected channels
             if not channel.active:
